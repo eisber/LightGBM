@@ -140,24 +140,80 @@
                                      const char* parameters,
                                      const DatasetHandle reference,
                                      DatasetHandle* out) {
+    // printf("%s:%d START\n", __FILE__, __LINE__);
     jclass sparseVectorClass = jenv->FindClass("org/apache/spark/ml/linalg/SparseVector");
+    if (jenv->ExceptionCheck()) {
+        printf("%s:%d EXCEPTION\n", __FILE__, __LINE__);
+      return -1;
+    }
+
+    // printf("%s:%d indices\n", __FILE__, __LINE__);
+    // fflush(stdout);
     jmethodID sparseVectorIndices = jenv->GetMethodID(sparseVectorClass, "indices", "()[I");
+    if (jenv->ExceptionCheck()) {
+      printf("%s:%d EXCEPTION\n", __FILE__, __LINE__);
+      return -1;
+    }
+
+    // printf("%s:%d values\n", __FILE__, __LINE__);
     jmethodID sparseVectorValues = jenv->GetMethodID(sparseVectorClass, "values", "()[D");
+    if (jenv->ExceptionCheck()) {
+      printf("%s:%d EXCEPTION\n", __FILE__, __LINE__);
+      return -1;
+    }
 
     std::vector<CSRDirect> jniCache;
     jniCache.reserve(num_rows);
 
+    // need a local ref for each indices + values + temporary for the vector
+    jenv->EnsureLocalCapacity(num_rows * 2 + 1);
+
+    bool javaExceptionHappened = false;
     // this needs to be done ahead of time as row_func is invoked from multiple threads
     // these threads would have to be registered with the JVM and also unregistered.
     // It is not clear if that can be achieved with OpenMP
     for (int i = 0; i < num_rows; i++) {
+      if (i == 0)
+         printf("%s:%d row %d\n", __FILE__, __LINE__, i);
       // get the row
       jobject objSparseVec = jenv->GetObjectArrayElement(arrayOfSparseVector, i);
+    // fflush(stdout);
+      // printf("%s:%d row %d\n", __FILE__, __LINE__, i);
+      if (jenv->ExceptionCheck()) {
+        printf("%s:%d EXCEPTION\n", __FILE__, __LINE__);
+        javaExceptionHappened = true;
+        break;
+      }
 
       // get the size, indices and values
       auto indices = (jintArray)jenv->CallObjectMethod(objSparseVec, sparseVectorIndices);
+    
+      // printf("%s:%d row %d\n", __FILE__, __LINE__, i);
+      if (jenv->ExceptionCheck()) {
+        printf("%s:%d EXCEPTION\n", __FILE__, __LINE__);
+        // stop calling anything and just cleanup
+        javaExceptionHappened = true;
+        break;
+      }
+
       auto values = (jdoubleArray)jenv->CallObjectMethod(objSparseVec, sparseVectorValues);
+    
+      // printf("%s:%d row %d\n", __FILE__, __LINE__, i);
+      if (jenv->ExceptionCheck()) {
+        printf("%s:%d EXCEPTION\n", __FILE__, __LINE__);
+        // stop calling anything and just cleanup
+        javaExceptionHappened = true;
+        break;
+      }
+
       int size = jenv->GetArrayLength(indices);
+      if (jenv->ExceptionCheck()) {
+        printf("%s:%d EXCEPTION\n", __FILE__, __LINE__);
+        // stop calling anything and just cleanup
+        javaExceptionHappened = true;
+        break;
+      }
+
 
       // Note: when testing on larger data (e.g. 288k rows per partition and 36mio rows total)
       // using GetPrimitiveArrayCritical resulted in a dead-lock
@@ -166,27 +222,47 @@
       // double* values0 = (double*)jenv->GetPrimitiveArrayCritical(values, 0);
       // in test-usecase an alternative to GetPrimitiveArrayCritical as it performs copies
       int* indices0 = (int *)jenv->GetIntArrayElements(indices, 0);
+      if (jenv->ExceptionCheck()) {
+        printf("%s:%d EXCEPTION\n", __FILE__, __LINE__);
+        // stop calling anything and just cleanup
+        javaExceptionHappened = true;
+        break;
+      }
+
       double* values0 = jenv->GetDoubleArrayElements(values, 0);
+      if (jenv->ExceptionCheck()) {
+        printf("%s:%d EXCEPTION\n", __FILE__, __LINE__);
+        // stop calling anything and just cleanup
+        javaExceptionHappened = true;
+        break;
+      }
 
       jniCache.push_back({indices, values, indices0, values0, size});
+
+      // reduce the load on local ref cache
+      jenv->DeleteLocalRef(objSparseVec);
     }
 
-    // type is important here as we want a std::function, rather than a lambda
-    std::function<void(int idx, std::vector<std::pair<int, double>>& ret)> row_func = [&](int row_num, std::vector<std::pair<int, double>>& ret) {
-      auto& jc = jniCache[row_num];
-      ret.clear();  // reset size, but not free()
-      ret.reserve(jc.size);  // make sure we have enough allocated
+    // check if we were able to get values and indices
+    int ret = -1;
+    if (!javaExceptionHappened) { 
+      // type is important here as we want a std::function, rather than a lambda
+      std::function<void(int idx, std::vector<std::pair<int, double>>& ret)> row_func = [&](int row_num, std::vector<std::pair<int, double>>& ret) {
+        auto& jc = jniCache[row_num];
+        ret.clear();  // reset size, but not free()
+        ret.reserve(jc.size);  // make sure we have enough allocated
 
-      // copy data
-      int* indices0p = jc.indices0;
-      double* values0p = jc.values0;
-      int* indices0e = indices0p + jc.size;
+        // copy data
+        int* indices0p = jc.indices0;
+        double* values0p = jc.values0;
+        int* indices0e = indices0p + jc.size;
 
-      for (; indices0p != indices0e; ++indices0p, ++values0p)
-        ret.emplace_back(*indices0p, *values0p);
-    };
+        for (; indices0p != indices0e; ++indices0p, ++values0p)
+          ret.emplace_back(*indices0p, *values0p);
+      };
 
-    int ret = LGBM_DatasetCreateFromCSRFunc(&row_func, num_rows, num_col, parameters, reference, out);
+      ret = LGBM_DatasetCreateFromCSRFunc(&row_func, num_rows, num_col, parameters, reference, out);
+    }
 
     for (auto& jc : jniCache) {
       // jenv->ReleasePrimitiveArrayCritical(jc.values, jc.values0, JNI_ABORT);
